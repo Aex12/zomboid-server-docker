@@ -22,6 +22,7 @@ ZOMBIEBUDDY="${ZOMBIEBUDDY:-false}"
 ZOMBIEBUDDY_POLICY="${ZOMBIEBUDDY_POLICY:-allow-all}"
 ZOMBIEBUDDY_ARGS="${ZOMBIEBUDDY_ARGS:-}"
 ZOMBIEBUDDY_WORKSHOP_ID=3619862853
+AUTO_UPDATE="${AUTO_UPDATE:-false}"
 GAME_APP_ID=108600 # Workshop items belong to the game, not the server app
 
 STEAMCMD_DIR="${STEAMCMD_DIR:-/data/steamcmd}"
@@ -68,11 +69,15 @@ update_server() {
   die "Server install failed: $SERVER_DIR/start-server.sh not found"
 }
 
-link_steamclient() {
+# A copy, not a symlink: SteamCMD may update itself (auto-update checks run it
+# while the server is up), and must not swap the library under the server.
+copy_steamclient() {
   local src="$STEAMCMD_DIR/linux64/steamclient.so"
+  local dest="$HOME/.steam/sdk64/steamclient.so"
   if [[ -f "$src" ]]; then
-    mkdir -p "$HOME/.steam/sdk64"
-    ln -sfn "$src" "$HOME/.steam/sdk64/steamclient.so"
+    mkdir -p "$(dirname "$dest")"
+    rm -f "$dest" # older images left a symlink here; cp would write through it
+    cp "$src" "$dest"
   fi
 }
 
@@ -279,12 +284,21 @@ watch_config() {
 }
 
 watcher_pid=""
+updater_pid=""
 stdin_pid=""
+
+stop_helpers() {
+  local pid
+  for pid in "$watcher_pid" "$updater_pid" "$stdin_pid"; do
+    [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+  done
+}
 
 # shellcheck disable=SC2329 # invoked via trap
 shutdown() {
   log "Received stop signal, sending 'quit' to the server (it saves before exiting)"
   [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
+  [[ -z "$updater_pid" ]] || kill "$updater_pid" 2>/dev/null || true
   printf 'quit\n' >&3 || true
 }
 
@@ -293,7 +307,7 @@ main() {
   if [[ "$UPDATE_ON_START" == "true" || ! -x "$SERVER_DIR/start-server.sh" ]]; then
     update_server
   fi
-  link_steamclient
+  copy_steamclient
   set_max_memory
   setup_zombiebuddy
 
@@ -336,6 +350,12 @@ main() {
     watcher_pid=$!
   fi
 
+  if [[ "$AUTO_UPDATE" == "true" ]]; then
+    export SERVER_NAME STEAM_BRANCH UPDATE_ON_START STEAMCMD_DIR SERVER_DIR ZOMBOID_DIR CONSOLE_FIFO
+    pz-auto-update &
+    updater_pid=$!
+  fi
+
   # Forward the container's own stdin to the console, so `kubectl attach -i` /
   # `docker attach` work like the server's terminal. Without an open stdin
   # this reads /dev/null and exits immediately.
@@ -349,8 +369,7 @@ main() {
     if wait "$server_pid"; then status=0; else status=$?; fi
     kill -0 "$server_pid" 2>/dev/null || break
   done
-  [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
-  [[ -z "$stdin_pid" ]] || kill "$stdin_pid" 2>/dev/null || true
+  stop_helpers
   log "Server exited with status $status"
   exit "$status"
 }

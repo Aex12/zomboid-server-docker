@@ -15,6 +15,8 @@ configured with the server's **own config files**, not environment variables.
   with `reloadoptions`, with no restart.
 - A clean shutdown on `SIGTERM` sends `quit` to the server console, so the
   world is saved.
+- Optional automatic updates: restarts the server when a game or Workshop
+  update is out, without kicking anyone (see [Automatic updates](#automatic-updates)).
 
 ```
 ghcr.io/<owner>/zomboid-server:<version>
@@ -60,9 +62,11 @@ a trailing newline is stripped and multi-line values are rejected. Only key
 names are logged, never values. The rendered file is mode `0600`.
 
 Settings worth keeping secret: `Password` (join password), `DiscordToken`,
-`WebhookAddress` and `RCONPassword` if you enable those. You don't need RCON
-for administration: `pz-console` (below) sends commands to the same console.
-Leave `RCONPassword` empty to keep RCON disabled.
+`WebhookAddress` and `RCONPassword` if you enable those. RCON is disabled
+while `RCONPassword` is empty. You don't need it for administration
+(`pz-console` sends commands to the same console), but `AUTO_UPDATE` uses it
+to count players. Inside the container it is reached on `127.0.0.1`, so there
+is no need to publish the RCON port.
 
 The admin password is not an `.ini` setting; see `ADMIN_PASSWORD_FILE`.
 
@@ -88,6 +92,15 @@ settings and mod lists are read at startup and need a restart.
 | `ZOMBIEBUDDY`          | `false`        | Install and load the [ZombieBuddy](https://github.com/zed-0xff/ZombieBuddy) Java agent (see below). |
 | `ZOMBIEBUDDY_POLICY`   | `allow-all`    | ZombieBuddy approval policy for Java mod JARs: `allow-all`, `deny-new` or `prompt`. |
 | `ZOMBIEBUDDY_ARGS`     | *(unset)*      | Extra ZombieBuddy agent parameters, comma-separated (e.g. `verbosity=1`). |
+| `AUTO_UPDATE`          | `false`        | Restart the server when a game or Workshop update is out (see below). Needs `RCONPassword`. |
+| `AUTO_UPDATE_INTERVAL` | `15m`          | How often to check Steam for updates. |
+| `AUTO_UPDATE_REMINDER` | `30m`          | How often to repeat the in-game warning while players are online. |
+| `AUTO_UPDATE_EMPTY_GRACE` | `2m`        | How long the server must stay empty after the last player leaves before it restarts. |
+| `AUTO_UPDATE_MAX_WAIT` | `off`          | If set (e.g. `6h`), restart anyway this long after the update was found, after a countdown. |
+| `AUTO_UPDATE_COUNTDOWN` | `10m`         | Warning time before an `AUTO_UPDATE_MAX_WAIT` restart. |
+| `DISCORD_WEBHOOK_FILE` | *(unset)*      | File containing a Discord webhook URL; `AUTO_UPDATE` posts its notices there. |
+
+Durations take `s`, `m`, `h` or `d` (`90s`, `15m`, `6h`); a bare number is seconds.
 
 Extra container arguments are passed to `start-server.sh`, for example `-debug`.
 
@@ -122,6 +135,58 @@ Java mod JAR. A server can't show a dialog, so:
 
 Players need ZombieBuddy installed on their own game too (see the mod's
 installation guide).
+
+### Automatic updates
+
+When a Workshop mod (or the game) updates, players who already have the new
+version can't join a server still running the old one. With
+`AUTO_UPDATE=true`, a background watcher checks Steam every
+`AUTO_UPDATE_INTERVAL` and restarts the server to install updates:
+
+- **Nobody online:** it restarts right away.
+- **Players online:** it warns them in game (repeated every
+  `AUTO_UPDATE_REMINDER`) and restarts once everyone has left and the server
+  has stayed empty for `AUTO_UPDATE_EMPTY_GRACE`. Nobody gets kicked, unless
+  `AUTO_UPDATE_MAX_WAIT` is set: then the server restarts that long after the
+  update was found, after an `AUTO_UPDATE_COUNTDOWN` warning.
+- More updates found while waiting are added to the same restart.
+
+What is checked:
+
+- **Workshop items** in `WorkshopItems=`: the `time_updated` from the Steam Web
+  API against the installed copy (`steamapps/workshop/appworkshop_108600.acf`).
+  Items not installed yet are skipped.
+- **The game** on `STEAM_BRANCH`: the build ID from SteamCMD against the
+  installed one (`steamapps/appmanifest_380870.acf`). Only with
+  `UPDATE_ON_START=true`, since otherwise a restart wouldn't install it.
+
+The restart is `quit` on the console: the server saves and exits, the container
+exits with status 0, and the container runtime starts it again (Kubernetes
+always does; with Docker use `--restart unless-stopped`). On start, SteamCMD
+installs the game update and the server downloads the updated Workshop items.
+
+It never restarts twice for the same version: if an update is still missing
+after a restart for it, the watcher logs a warning and leaves it alone. Its
+state lives in `/data/zomboid/auto-update/`.
+
+The watcher needs RCON to count players (set `RCONPassword`, see
+[Secrets](#secrets-files-in-secretsini)); without it, auto-update stays off
+and logs why.
+
+#### Discord notices
+
+Set `DISCORD_WEBHOOK_FILE` to a file holding a
+[Discord webhook](https://support.discord.com/hc/en-us/articles/228383668) URL
+(in Discord: *Server Settings → Integrations → Webhooks → New Webhook → Copy
+Webhook URL*). The watcher posts when:
+
+- an update is found while players are online,
+- the server restarts for an update,
+- the server is back online after that restart.
+
+Keep the URL secret: anyone with it can post to the channel. Mount it like the
+other secrets, not in an environment variable. Don't put it in `/secrets/ini`:
+every file there is written into the `.ini`.
 
 ### Volumes
 
@@ -173,6 +238,13 @@ appears in the container logs:
 kubectl exec deploy/zomboid -- pz-console players
 kubectl exec deploy/zomboid -- pz-console save
 kubectl exec deploy/zomboid -- pz-console 'servermsg "Restart in 5 minutes"'
+```
+
+With RCON enabled, `pz-rcon` sends a command the same way but prints the
+reply right there instead of in the logs:
+
+```sh
+kubectl exec deploy/zomboid -- pz-rcon players
 ```
 
 ## Kubernetes
@@ -245,7 +317,7 @@ Also:
 ## Docker
 
 ```sh
-docker run -d --name zomboid \
+docker run -d --name zomboid --restart unless-stopped \
   -p 16261:16261/udp -p 16262:16262/udp \
   -v zomboid-data:/data \
   -v ./config:/config:ro \

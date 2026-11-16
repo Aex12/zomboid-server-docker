@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run a command on the running server over RCON and print the reply.
+# Unlike pz-console, the reply comes back here instead of in the container log.
+#
+#   pz-rcon players
+#   pz-rcon 'servermsg "Hello"'
+#
+# Address and password come from the rendered <SERVER_NAME>.ini (RCONPort,
+# RCONPassword); RCON is disabled while RCONPassword is empty.
+set -euo pipefail
+
+SERVER_NAME="${SERVER_NAME:-servertest}"
+ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
+INI="$ZOMBOID_DIR/Server/$SERVER_NAME.ini"
+
+if (( $# == 0 )); then
+  echo "usage: pz-rcon <command> [args...]" >&2
+  exit 2
+fi
+if [[ ! -r "$INI" ]]; then
+  echo "pz-rcon: $INI not found; is the server running?" >&2
+  exit 1
+fi
+
+# Last value of a key in the .ini, without a trailing CR.
+ini_value() {
+  local value
+  value="$(sed -n "s/^$1=//p" "$INI" | tail -n 1)"
+  printf '%s' "${value%$'\r'}"
+}
+
+port="$(ini_value RCONPort)"
+password="$(ini_value RCONPassword)"
+if [[ -z "$password" ]]; then
+  echo "pz-rcon: RCON is disabled (RCONPassword is empty)" >&2
+  exit 1
+fi
+
+# The password goes into a private config file, not onto the command line.
+# JSON is valid YAML, so jq takes care of quoting.
+umask 077
+config="$(mktemp --suffix=.yaml)" # rcon-cli picks the parser by extension
+trap 'rm -f "$config"' EXIT
+jq -n --arg address "127.0.0.1:${port:-27015}" --arg password "$password" \
+  '{default: {address: $address, password: $password, type: "rcon", log: "", timeout: "10s"}}' > "$config"
+
+rcon -c "$config" "$*"

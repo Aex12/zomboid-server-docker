@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# Restart the server when a game or Workshop update is published.
+#
+# Started in the background by the entrypoint when AUTO_UPDATE=true. Every
+# AUTO_UPDATE_INTERVAL it compares the installed game build and Workshop items
+# with Steam. When something is out of date, a restart becomes pending:
+#
+#   - nobody online: restart right away;
+#   - players online: warn them in game (repeated every AUTO_UPDATE_REMINDER)
+#     and restart once everyone has left for AUTO_UPDATE_EMPTY_GRACE, or after
+#     AUTO_UPDATE_MAX_WAIT (with an AUTO_UPDATE_COUNTDOWN warning) if set.
+#
+# A restart is `quit` on the server console: the server saves and exits, the
+# entrypoint exits, and the container restarts, which installs the updates
+# (UPDATE_ON_START for the game, the server itself for Workshop items).
+#
+# Needs RCON (a non-empty RCONPassword) to count players. Optional Discord
+# notifications go to the webhook URL in DISCORD_WEBHOOK_FILE.
+set -uo pipefail # no -e: a failed check must never stop the watcher
+
+STEAM_APP_ID=380870
+GAME_APP_ID=108600
+
+SERVER_NAME="${SERVER_NAME:-servertest}"
+STEAM_BRANCH="${STEAM_BRANCH:-public}"
+UPDATE_ON_START="${UPDATE_ON_START:-true}"
+STEAMCMD_DIR="${STEAMCMD_DIR:-/data/steamcmd}"
+SERVER_DIR="${SERVER_DIR:-/data/server}"
+ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
+CONSOLE_FIFO="${CONSOLE_FIFO:-/tmp/pz-console}"
+DISCORD_WEBHOOK_FILE="${DISCORD_WEBHOOK_FILE:-}"
+
+INI="$ZOMBOID_DIR/Server/$SERVER_NAME.ini"
+GAME_MANIFEST="$SERVER_DIR/steamapps/appmanifest_$STEAM_APP_ID.acf"
+WORKSHOP_MANIFEST="$SERVER_DIR/steamapps/workshop/appworkshop_$GAME_APP_ID.acf"
+# Persistent state, survives the restart:
+#   restart    what the last update restart was for (for the "back online" message)
+#   attempted  versions a restart was already done for (never restart twice for one)
+STATE_DIR="$ZOMBOID_DIR/auto-update"
+# Throwaway HOME for SteamCMD, so its app info cache can be wiped before every
+# check without touching the server's Steam files.
+STEAM_HOME="/tmp/auto-update-steam"
+TICK=30
+
+# stderr: check_updates' stdout is its result.
+log() { printf '[auto-update] %s\n' "$*" >&2; }
+
+# "90", "90s", "15m", "2h", "1d" -> seconds. Empty or "off" -> 0.
+duration() {
+  local value="${1,,}"
+  case "$value" in
+    ''|off|false) echo 0 ;;
+    *[0-9]s) echo "${value%s}" ;;
+    *[0-9]m) echo $(( ${value%m} * 60 )) ;;
+    *[0-9]h) echo $(( ${value%h} * 3600 )) ;;
+    *[0-9]d) echo $(( ${value%d} * 86400 )) ;;
+    *[0-9]) echo "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+# AUTO_UPDATE_<NAME> -> <NAME>, in seconds.
+INTERVAL=0 REMINDER=0 EMPTY_GRACE=0 MAX_WAIT=0 COUNTDOWN=0
+for var in AUTO_UPDATE_INTERVAL:15m AUTO_UPDATE_REMINDER:30m AUTO_UPDATE_EMPTY_GRACE:2m \
+           AUTO_UPDATE_MAX_WAIT:off AUTO_UPDATE_COUNTDOWN:10m; do
+  name="${var%%:*}"
+  value="${!name:-${var#*:}}"
+  seconds="$(duration "$value" 2>/dev/null)" || { log "ERROR: $name: invalid duration '$value' (use e.g. 90s, 15m, 2h); auto-update disabled"; exit 1; }
+  printf -v "${name#AUTO_UPDATE_}" '%s' "$seconds"
+done
+(( INTERVAL > 0 )) || { log "ERROR: AUTO_UPDATE_INTERVAL must be more than 0; auto-update disabled"; exit 1; }
+
+# --- Steam -------------------------------------------------------------------
+
+# Value of the first "key" "value" line in a Valve .acf/.vdf file.
+acf_value() {
+  awk -v key="\"$1\"" '$1 == key { gsub(/"/, "", $2); print $2; exit }' "$2" 2>/dev/null
+}
+
+installed_build() { acf_value buildid "$GAME_MANIFEST"; }
+
+# Latest build on $STEAM_BRANCH, from SteamCMD's app info.
+remote_build() {
+  mkdir -p "$STEAM_HOME"
+  rm -rf "$STEAM_HOME/Steam/appcache" # it sometimes serves stale app info
+  HOME="$STEAM_HOME" "$STEAMCMD_DIR/steamcmd.sh" \
+      +login anonymous +app_info_update 1 +app_info_print "$STEAM_APP_ID" +quit 2>/dev/null \
+    | awk -v branch="\"$STEAM_BRANCH\"" '
+        { gsub(/^[ \t]+|[ \t\r]+$/, "") }
+        $0 == "\"branches\"" { in_branches = 1; next }
+        in_branches && $0 == branch { in_branch = 1; next }
+        in_branch && $1 == "\"buildid\"" { gsub(/"/, "", $2); print $2; exit }
+      '
+}
+
+# Installed Workshop items as "<id> <timeupdated>" lines.
+installed_items() {
+  awk '
+    { gsub(/^[ \t]+|[ \t\r]+$/, "") }
+    $0 == "\"WorkshopItemsInstalled\"" { section = 1; next }
+    $0 == "\"WorkshopItemDetails\"" { section = 0; next }
+    section && /^"[0-9]+"$/ { gsub(/"/, ""); id = $0; next }
+    section && id != "" && $1 == "\"timeupdated\"" { gsub(/"/, "", $2); print id, $2 }
+  ' "$WORKSHOP_MANIFEST" 2>/dev/null
+}
+
+# WorkshopItems from the rendered .ini, one ID per line.
+workshop_items() {
+  sed -n 's/^WorkshopItems=//p' "$INI" 2>/dev/null | tail -n 1 | tr -d '\r' | tr ';' '\n' \
+    | tr -d ' ' | grep -E '^[0-9]+$'
+}
+
+# Print one line per available update: "<id>\t<version>\t<name>", where <id>
+# names the thing being updated (one pending entry each) and <version> the
+# exact version (for the attempted list).
+check_updates() {
+  if [[ "$UPDATE_ON_START" == "true" ]]; then
+    local installed remote
+    installed="$(installed_build)"
+    remote="$(remote_build)"
+    [[ -n "$remote" ]] || remote="$(remote_build)" # e.g. SteamCMD updated itself
+    if [[ -z "$installed" || -z "$remote" ]]; then
+      log "WARNING: could not read the game build (installed: '${installed:-?}', Steam: '${remote:-?}')"
+    elif [[ "$remote" != "$installed" ]]; then
+      printf 'game\tgame:%s\tProject Zomboid (build %s)\n' "$remote" "$remote"
+    fi
+  fi
+
+  local ids=() args=() i response installed_json
+  mapfile -t ids < <(workshop_items)
+  (( ${#ids[@]} > 0 )) || return 0
+  args=(-d "itemcount=${#ids[@]}")
+  for i in "${!ids[@]}"; do
+    args+=(-d "publishedfileids[$i]=${ids[$i]}")
+  done
+  if ! response="$(curl -fsS --max-time 30 "${args[@]}" \
+        https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/)"; then
+    log "WARNING: Steam Workshop API request failed"
+    return 0
+  fi
+  installed_json="$(installed_items | jq -Rn '[inputs | split(" ") | {(.[0]): (.[1] | tonumber)}] | add // {}')"
+  # Items that are not installed yet are skipped: the server installs those
+  # itself, and a mod removed from the Workshop must not cause restart loops.
+  jq -r --argjson installed "$installed_json" '
+    .response.publishedfiledetails[]?
+    | select(.result == 1 and $installed[.publishedfileid] != null
+             and .time_updated > $installed[.publishedfileid])
+    | "mod:\(.publishedfileid)\tmod:\(.publishedfileid):\(.time_updated)\t\(.title | gsub("[\\t\\r\\n\"]"; " "))"
+  ' <<< "$response"
+}
+
+# --- Server ------------------------------------------------------------------
+
+console() { printf '%s\n' "$*" > "$CONSOLE_FIFO"; }
+
+# servermsg breaks on double quotes.
+broadcast() { console "servermsg \"${1//\"/\'}\""; }
+
+# Number of players online, or failure if the server can't be asked.
+player_count() {
+  local reply
+  reply="$(pz-rcon players 2>/dev/null)" || return 1
+  [[ "$reply" =~ Players\ connected\ \(([0-9]+)\) ]] || return 1
+  echo "${BASH_REMATCH[1]}"
+}
+
+notify() {
+  [[ -n "$DISCORD_WEBHOOK_FILE" ]] || return 0
+  local url
+  if [[ ! -r "$DISCORD_WEBHOOK_FILE" ]]; then
+    log "WARNING: DISCORD_WEBHOOK_FILE '$DISCORD_WEBHOOK_FILE' is not readable"
+    return 0
+  fi
+  url="$(<"$DISCORD_WEBHOOK_FILE")"
+  url="${url%$'\r'}"
+  # The URL is the secret: pass it in a curl config on a pipe, not as an argument.
+  jq -n --arg content "$1" '{content: $content, allowed_mentions: {parse: []}}' \
+    | curl -fsS --max-time 15 -o /dev/null -H 'Content-Type: application/json' \
+        --data-binary @- -K <(printf 'url = "%s"\n' "$url") \
+    || log "WARNING: Discord notification failed"
+}
+
+# --- Pending restart ---------------------------------------------------------
+
+declare -A pending=()   # id -> version
+declare -A names=()     # id -> name
+declare -A warned=()    # version -> 1, versions already logged as skipped
+pending_order=()
+pending_since=0
+seen_players=false
+empty_since=0
+last_reminder=0
+force_at=0
+force_warned=false
+
+# "RealLimbs, Project Viewpoint and 3 more"
+pending_summary() {
+  local list=() id
+  for id in "${pending_order[@]}"; do list+=("${names[$id]}"); done
+  local count=${#list[@]} shown
+  if (( count > 4 )); then
+    shown="$(printf '%s, ' "${list[@]:0:3}")"
+    echo "${shown%, } and $(( count - 3 )) more"
+  elif (( count > 1 )); then
+    shown="$(printf '%s, ' "${list[@]:0:count-1}")"
+    echo "${shown%, } and ${list[count-1]}"
+  else
+    echo "${list[0]}"
+  fi
+}
+
+attempted() { grep -qxF "$1" "$STATE_DIR/attempted" 2>/dev/null; }
+
+# Add new updates to the pending restart. Succeeds if anything was added.
+collect_updates() {
+  local id version name added=false
+  while IFS=$'\t' read -r id version name; do
+    [[ -n "$id" ]] || continue
+    if attempted "$version"; then
+      if [[ ! -v "warned[$version]" ]]; then
+        log "WARNING: $name ($version) is still not installed after a restart for it; not restarting again for this version"
+        warned[$version]=1
+      fi
+      continue
+    fi
+    [[ "${pending[$id]:-}" == "$version" ]] && continue
+    [[ -v "pending[$id]" ]] || pending_order+=("$id")
+    pending[$id]="$version"
+    names[$id]="$name"
+    log "Update available: $name ($version)"
+    added=true
+  done < <(check_updates)
+  [[ "$added" == "true" ]]
+}
+
+warning_text() {
+  echo "Update available: $(pending_summary). Players who have it can't join until the server restarts. The server restarts automatically once everyone has left."
+}
+
+restart_now() {
+  local summary
+  summary="$(pending_summary)"
+  log "Restarting to apply: $summary"
+  mkdir -p "$STATE_DIR"
+  local id
+  for id in "${pending_order[@]}"; do printf '%s\n' "${pending[$id]}"; done >> "$STATE_DIR/attempted"
+  # Keep the attempted list short.
+  tail -n 200 "$STATE_DIR/attempted" > "$STATE_DIR/attempted.tmp" && mv -f "$STATE_DIR/attempted.tmp" "$STATE_DIR/attempted"
+  printf '%s\n' "$summary" > "$STATE_DIR/restart"
+  notify "Restarting the server to apply: $summary. Back in a few minutes."
+  broadcast "Restarting now to apply: $summary. Back in a few minutes."
+  sleep 2
+  console quit
+  exit 0
+}
+
+handle_pending() {
+  local now="$1" count
+  if ! count="$(player_count)"; then
+    log "WARNING: could not get the player count over RCON; waiting"
+    return
+  fi
+
+  if (( count == 0 )); then
+    [[ "$seen_players" == "true" ]] || restart_now
+    if (( empty_since == 0 )); then
+      empty_since=$now
+      log "Everyone has left; restarting in ${EMPTY_GRACE}s unless someone joins"
+    fi
+    (( now - empty_since >= EMPTY_GRACE )) && restart_now
+    return
+  fi
+
+  if [[ "$seen_players" != "true" ]]; then
+    seen_players=true
+    notify "$(warning_text) ($count online)"
+  fi
+  if (( empty_since != 0 )); then
+    log "A player joined again; waiting for everyone to leave"
+    empty_since=0
+  fi
+
+  if (( MAX_WAIT > 0 && force_at == 0 && now - pending_since >= MAX_WAIT )); then
+    force_at=$(( now + COUNTDOWN ))
+    log "Waited ${MAX_WAIT}s; restarting in ${COUNTDOWN}s"
+    broadcast "The server restarts in $(( COUNTDOWN / 60 )) min to apply: $(pending_summary)."
+    notify "The server restarts in $(( COUNTDOWN / 60 )) min to apply: $(pending_summary)."
+    last_reminder=$now
+  fi
+  if (( force_at != 0 )); then
+    (( now >= force_at )) && restart_now
+    if [[ "$force_warned" != "true" ]] && (( force_at - now <= 60 )); then
+      broadcast "The server restarts in 1 minute. Please log out now."
+      force_warned=true
+    fi
+    return
+  fi
+
+  if (( now - last_reminder >= REMINDER )); then
+    broadcast "$(warning_text)"
+    last_reminder=$now
+  fi
+}
+
+# --- Main --------------------------------------------------------------------
+
+main() {
+  if [[ -z "$(sed -n 's/^RCONPassword=//p' "$INI" 2>/dev/null | tail -n 1 | tr -d '\r')" ]]; then
+    log "ERROR: AUTO_UPDATE needs RCON to count players; set RCONPassword. Auto-update disabled."
+    exit 1
+  fi
+  [[ "$UPDATE_ON_START" == "true" ]] || log "UPDATE_ON_START is not true: only Workshop updates are checked"
+
+  log "Waiting for the server to come up"
+  until player_count > /dev/null; do sleep 10; done
+  log "Server is up; checking for updates every ${INTERVAL}s"
+
+  if [[ -f "$STATE_DIR/restart" ]]; then
+    notify "The server is back online (updated: $(<"$STATE_DIR/restart"))."
+    rm -f "$STATE_DIR/restart"
+  fi
+
+  local now last_check=0
+  while :; do
+    now=$(date +%s)
+    if (( now - last_check >= INTERVAL )); then
+      last_check=$now
+      if collect_updates; then
+        (( pending_since != 0 )) || pending_since=$now
+        # Announce the new list to anyone already waiting it out.
+        if [[ "$seen_players" == "true" && $force_at -eq 0 ]]; then
+          broadcast "$(warning_text)"
+          notify "$(warning_text)"
+          last_reminder=$now
+        fi
+      fi
+    fi
+    (( pending_since == 0 )) || handle_pending "$now"
+    sleep "$TICK"
+  done
+}
+
+main
