@@ -15,8 +15,8 @@ configured with the server's **own config files**, not environment variables.
   with `reloadoptions`, with no restart.
 - A clean shutdown on `SIGTERM` sends `quit` to the server console, so the
   world is saved.
-- Optional automatic updates: restarts the server when a game or Workshop
-  update is out, without kicking anyone (see [Automatic updates](#automatic-updates)).
+- Optional automatic restarts, when a game or Workshop update is out and/or
+  on a schedule, without kicking anyone (see [Automatic restarts](#automatic-restarts)).
 
 ```
 ghcr.io/<owner>/zomboid-server:<version>
@@ -64,7 +64,7 @@ names are logged, never values. The rendered file is mode `0600`.
 Settings worth keeping secret: `Password` (join password), `DiscordToken`,
 `WebhookAddress` and `RCONPassword` if you enable those. RCON is disabled
 while `RCONPassword` is empty. You don't need it for administration
-(`pz-console` sends commands to the same console), but `AUTO_UPDATE` uses it
+(`pz-console` sends commands to the same console), but automatic restarts use it
 to count players. Inside the container it is reached on `127.0.0.1`, so there
 is no need to publish the RCON port.
 
@@ -94,11 +94,14 @@ settings and mod lists are read at startup and need a restart.
 | `ZOMBIEBUDDY_ARGS`     | *(unset)*      | Extra ZombieBuddy agent parameters, comma-separated (e.g. `verbosity=1`). |
 | `AUTO_UPDATE`          | `false`        | Restart the server when a game or Workshop update is out (see below). Needs `RCONPassword`. |
 | `AUTO_UPDATE_INTERVAL` | `15m`          | How often to check Steam for updates. |
-| `AUTO_UPDATE_REMINDER` | `30m`          | How often to repeat the in-game warning while players are online. |
-| `AUTO_UPDATE_EMPTY_GRACE` | `2m`        | How long the server must stay empty after the last player leaves before it restarts. |
-| `AUTO_UPDATE_MAX_WAIT` | `off`          | If set (e.g. `6h`), restart anyway this long after the update was found, after a countdown. |
-| `AUTO_UPDATE_COUNTDOWN` | `10m`         | Warning time before an `AUTO_UPDATE_MAX_WAIT` restart. |
-| `DISCORD_WEBHOOK_FILE` | *(unset)*      | File containing a Discord webhook URL; `AUTO_UPDATE` posts its notices there. |
+| `RESTART_SCHEDULE`     | *(unset)*      | Cron expression for scheduled restarts, e.g. `0 4 * * *` (see below). Needs `RCONPassword`. |
+| `RESTART_MIN_UPTIME`   | `off`          | Skip a scheduled restart if the server has been up for less than this, e.g. `72h`. |
+| `TZ`                   | *(UTC)*        | Time zone of `RESTART_SCHEDULE`, e.g. `Europe/Madrid`. |
+| `RESTART_REMINDER`     | `30m`          | How often to repeat the in-game warning while players are online. |
+| `RESTART_EMPTY_GRACE`  | `2m`           | How long the server must stay empty after the last player leaves before it restarts. |
+| `RESTART_MAX_WAIT`     | `off`          | If set (e.g. `6h`), restart anyway this long after the restart became pending, after a countdown. |
+| `RESTART_COUNTDOWN`    | `10m`          | Warning time before a `RESTART_MAX_WAIT` restart. |
+| `DISCORD_WEBHOOK_FILE` | *(unset)*      | File containing a Discord webhook URL; automatic restarts post their notices there. |
 
 Durations take `s`, `m`, `h` or `d` (`90s`, `15m`, `6h`); a bare number is seconds.
 
@@ -136,21 +139,25 @@ Java mod JAR. A server can't show a dialog, so:
 Players need ZombieBuddy installed on their own game too (see the mod's
 installation guide).
 
-### Automatic updates
+### Automatic restarts
 
-When a Workshop mod (or the game) updates, players who already have the new
-version can't join a server still running the old one. With
-`AUTO_UPDATE=true`, a background watcher checks Steam every
-`AUTO_UPDATE_INTERVAL` and restarts the server to install updates:
+A background watcher (`pz-auto-restart`) restarts the server when a game or
+Workshop update is out (`AUTO_UPDATE=true`), on a schedule
+(`RESTART_SCHEDULE`), or both. Whatever the reason, once a restart is pending:
 
 - **Nobody online:** it restarts right away.
 - **Players online:** it warns them in game (repeated every
-  `AUTO_UPDATE_REMINDER`) and restarts once everyone has left and the server
-  has stayed empty for `AUTO_UPDATE_EMPTY_GRACE`. Nobody gets kicked, unless
-  `AUTO_UPDATE_MAX_WAIT` is set: then the server restarts that long after the
-  update was found, after an `AUTO_UPDATE_COUNTDOWN` warning.
-- More updates found while waiting are added to the same restart.
+  `RESTART_REMINDER`) and restarts once everyone has left and the server
+  has stayed empty for `RESTART_EMPTY_GRACE`. Nobody gets kicked, unless
+  `RESTART_MAX_WAIT` is set: then the server restarts that long after the
+  restart became pending, after a `RESTART_COUNTDOWN` warning.
+- Updates found or a schedule match while waiting join the same restart.
 
+#### Updates
+
+When a Workshop mod (or the game) updates, players who already have the new
+version can't join a server still running the old one. With
+`AUTO_UPDATE=true`, the watcher checks Steam every `AUTO_UPDATE_INTERVAL`.
 What is checked:
 
 - **Workshop items** in `WorkshopItems=`: the `time_updated` from the Steam Web
@@ -167,11 +174,35 @@ installs the game update and the server downloads the updated Workshop items.
 
 It never restarts twice for the same version: if an update is still missing
 after a restart for it, the watcher logs a warning and leaves it alone. Its
-state lives in `/data/zomboid/auto-update/`.
+state lives in `/data/zomboid/auto-restart/`.
+
+#### Scheduled restarts
+
+`RESTART_SCHEDULE` takes a cron expression, run by
+[supercronic](https://github.com/aptible/supercronic) in the container's `TZ`
+(UTC unless set). An invalid expression stops the container at start.
+
+| Schedule | `RESTART_SCHEDULE` | `RESTART_MIN_UPTIME` |
+| --- | --- | --- |
+| Every day at 6:00 | `0 6 * * *` | |
+| Every 4 hours | `0 */4 * * *` | |
+| Every 3 days at 4:00 | `0 4 * * *` | `72h` |
+| Mondays and Thursdays at 5:30 | `30 5 * * mon,thu` | |
+
+At a match the restart becomes pending, unless the server has been up for less
+than `RESTART_MIN_UPTIME`. That covers "every N days", which cron can't express
+well (`*/3` in the day field restarts on the 31st and again on the 1st), and
+avoids a scheduled restart shortly after another one (e.g. for an update). Note
+that `72h` with a 4:00 schedule needs an uptime of a full 72 hours, so set it a
+bit lower (e.g. `71h`) if the server comes back a few minutes after 4:00.
+
+Every restart also installs game and Workshop updates, as on any start.
+
+#### Requirements
 
 The watcher needs RCON to count players (set `RCONPassword`, see
-[Secrets](#secrets-files-in-secretsini)); without it, auto-update stays off
-and logs why.
+[Secrets](#secrets-files-in-secretsini)); without it, automatic restarts stay
+off and log why. Follow it in the logs with `grep auto-restart`.
 
 #### Discord notices
 
@@ -180,8 +211,9 @@ Set `DISCORD_WEBHOOK_FILE` to a file holding a
 (in Discord: *Server Settings → Integrations → Webhooks → New Webhook → Copy
 Webhook URL*). The watcher posts when:
 
-- an update is found while players are online,
-- the server restarts for an update,
+- a restart is pending while players are online (and when an update or the
+  schedule adds to it),
+- the server restarts,
 - the server is back online after that restart.
 
 Keep the URL secret: anyone with it can post to the channel. Mount it like the

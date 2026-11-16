@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck entrypoint.sh pz-console pz-rcon pz-auto-update
+        run: shellcheck entrypoint.sh pz-console pz-rcon pz-auto-restart
       - name: hadolint
         uses: hadolint/hadolint-action@v3.5.0
         with:

@@ -23,6 +23,7 @@ ZOMBIEBUDDY_POLICY="${ZOMBIEBUDDY_POLICY:-allow-all}"
 ZOMBIEBUDDY_ARGS="${ZOMBIEBUDDY_ARGS:-}"
 ZOMBIEBUDDY_WORKSHOP_ID=3619862853
 AUTO_UPDATE="${AUTO_UPDATE:-false}"
+RESTART_SCHEDULE="${RESTART_SCHEDULE:-}"
 GAME_APP_ID=108600 # Workshop items belong to the game, not the server app
 
 STEAMCMD_DIR="${STEAMCMD_DIR:-/data/steamcmd}"
@@ -31,6 +32,9 @@ ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
 CONFIG_DIR="${CONFIG_DIR:-/config}"
 INI_SECRETS_DIR="${INI_SECRETS_DIR:-/secrets/ini}"
 CONSOLE_FIFO="${CONSOLE_FIFO:-/tmp/pz-console}"
+# RESTART_SCHEDULE: supercronic creates SCHEDULE_FLAG, pz-auto-restart acts on it.
+CRONTAB=/tmp/pz-crontab
+SCHEDULE_FLAG=/tmp/pz-restart-scheduled
 
 log() { printf '[entrypoint] %s\n' "$*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -69,7 +73,7 @@ update_server() {
   die "Server install failed: $SERVER_DIR/start-server.sh not found"
 }
 
-# A copy, not a symlink: SteamCMD may update itself (auto-update checks run it
+# A copy, not a symlink: SteamCMD may update itself (the update checks run it
 # while the server is up), and must not swap the library under the server.
 copy_steamclient() {
   local src="$STEAMCMD_DIR/linux64/steamclient.so"
@@ -283,13 +287,21 @@ watch_config() {
   done
 }
 
+# Write the crontab for RESTART_SCHEDULE and check it before the server starts.
+setup_schedule() {
+  printf '%s touch %s\n' "$RESTART_SCHEDULE" "$SCHEDULE_FLAG" > "$CRONTAB"
+  supercronic -test -quiet -no-reap "$CRONTAB" \
+    || die "RESTART_SCHEDULE: invalid cron expression '$RESTART_SCHEDULE' (use e.g. '0 4 * * *')"
+}
+
 watcher_pid=""
-updater_pid=""
+restarter_pid=""
+cron_pid=""
 stdin_pid=""
 
 stop_helpers() {
   local pid
-  for pid in "$watcher_pid" "$updater_pid" "$stdin_pid"; do
+  for pid in "$watcher_pid" "$restarter_pid" "$cron_pid" "$stdin_pid"; do
     [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
   done
 }
@@ -297,8 +309,10 @@ stop_helpers() {
 # shellcheck disable=SC2329 # invoked via trap
 shutdown() {
   log "Received stop signal, sending 'quit' to the server (it saves before exiting)"
-  [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
-  [[ -z "$updater_pid" ]] || kill "$updater_pid" 2>/dev/null || true
+  local pid
+  for pid in "$watcher_pid" "$restarter_pid" "$cron_pid"; do
+    [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+  done
   printf 'quit\n' >&3 || true
 }
 
@@ -310,6 +324,7 @@ main() {
   copy_steamclient
   set_max_memory
   setup_zombiebuddy
+  [[ -z "$RESTART_SCHEDULE" ]] || setup_schedule
 
   local fingerprint
   fingerprint="$(config_fingerprint)"
@@ -350,10 +365,16 @@ main() {
     watcher_pid=$!
   fi
 
-  if [[ "$AUTO_UPDATE" == "true" ]]; then
-    export SERVER_NAME STEAM_BRANCH UPDATE_ON_START STEAMCMD_DIR SERVER_DIR ZOMBOID_DIR CONSOLE_FIFO
-    pz-auto-update &
-    updater_pid=$!
+  if [[ "$AUTO_UPDATE" == "true" || -n "$RESTART_SCHEDULE" ]]; then
+    export SERVER_NAME STEAM_BRANCH UPDATE_ON_START STEAMCMD_DIR SERVER_DIR ZOMBOID_DIR CONSOLE_FIFO \
+           AUTO_UPDATE RESTART_SCHEDULE SCHEDULE_FLAG
+    pz-auto-restart &
+    restarter_pid=$!
+  fi
+  if [[ -n "$RESTART_SCHEDULE" ]]; then
+    # -no-reap: tini is PID 1 and reaps
+    supercronic -quiet -no-reap "$CRONTAB" &
+    cron_pid=$!
   fi
 
   # Forward the container's own stdin to the console, so `kubectl attach -i` /

@@ -22,6 +22,15 @@ RUN curl -fsSL -o /tmp/rcon.tar.gz \
  && tar -xzf /tmp/rcon.tar.gz -C /tmp \
  && install -m 0755 "/tmp/rcon-${RCON_CLI_VERSION}-amd64_linux/rcon" /usr/local/bin/rcon
 
+# supercronic (https://github.com/aptible/supercronic), a static binary, for
+# RESTART_SCHEDULE.
+ARG SUPERCRONIC_VERSION=0.2.51
+ARG SUPERCRONIC_SHA256=cc232108374e8e2b537045f2d5eaa1229f619db314c3ba6a14d38b35dc0aa123
+RUN curl -fsSL -o /tmp/supercronic \
+      "https://github.com/aptible/supercronic/releases/download/v${SUPERCRONIC_VERSION}/supercronic-linux-amd64" \
+ && echo "${SUPERCRONIC_SHA256}  /tmp/supercronic" | sha256sum -c - \
+ && install -m 0755 /tmp/supercronic /usr/local/bin/supercronic
+
 # --- Stage 2: runtime ---------------------------------------------------------
 FROM debian:trixie-slim
 
@@ -29,6 +38,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # lib32gcc-s1 / lib32stdc++6: SteamCMD is a 32-bit binary.
 # The Project Zomboid server ships its own JRE, so no Java is installed here.
+# tzdata: TZ for RESTART_SCHEDULE.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -37,6 +47,7 @@ RUN apt-get update \
       lib32gcc-s1 \
       lib32stdc++6 \
       tini \
+      tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 1000 --user-group --no-create-home --home-dir /data/home steam \
@@ -45,8 +56,8 @@ RUN useradd --uid 1000 --user-group --no-create-home --home-dir /data/home steam
 
 COPY --from=downloads /opt/steamcmd /opt/steamcmd
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY --from=downloads /usr/local/bin/rcon /usr/local/bin/rcon
-COPY --chmod=0755 pz-console pz-rcon pz-auto-update /usr/local/bin/
+COPY --from=downloads /usr/local/bin/rcon /usr/local/bin/supercronic /usr/local/bin/
+COPY --chmod=0755 pz-console pz-rcon pz-auto-restart /usr/local/bin/
 
 ENV HOME=/data/home \
     STEAMCMD_DIR=/data/steamcmd \
