@@ -1,0 +1,4 @@
+ignored:
+  # Pinning apt package versions breaks the build every time Ubuntu publishes
+  # a security update; the base image tag is the pin.
+  - DL3008

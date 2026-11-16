@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Send a command to the running server's console.
+# Output appears in the container logs.
+#
+#   pz-console reloadoptions
+#   pz-console players
+#   pz-console 'servermsg "Restarting in 5 minutes"'
+set -euo pipefail
+
+CONSOLE_FIFO="${CONSOLE_FIFO:-/tmp/pz-console}"
+
+if (( $# == 0 )); then
+  echo "usage: pz-console <command> [args...]" >&2
+  exit 2
+fi
+if [[ ! -p "$CONSOLE_FIFO" ]]; then
+  echo "pz-console: $CONSOLE_FIFO not found; is the server running?" >&2
+  exit 1
+fi
+
+printf '%s\n' "$*" > "$CONSOLE_FIFO"
