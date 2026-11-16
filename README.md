@@ -15,7 +15,7 @@ configured with the server's **own config files**, not environment variables.
   world is saved.
 
 ```
-ghcr.io/<owner>/zomboid-server-docker:<version>
+ghcr.io/<owner>/zomboid-server:<version>
 ```
 
 ## Configuration
@@ -152,7 +152,7 @@ docker run -d --name zomboid \
   -e ADMIN_PASSWORD_FILE=/secrets/admin-password \
   -e MAX_MEMORY=6g \
   --read-only --tmpfs /tmp:exec \
-  ghcr.io/<owner>/zomboid-server-docker:latest
+  ghcr.io/<owner>/zomboid-server:latest
 ```
 
 Stop it with `docker stop -t 120 zomboid` so the save can finish.
