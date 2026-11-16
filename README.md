@@ -85,8 +85,43 @@ settings and mod lists are read at startup and need a restart.
 | `ADMIN_PASSWORD_FILE`  | *(unset)*      | File containing the admin password, used on the first start to create the admin account. |
 | `CONFIG_POLL_INTERVAL` | `10`           | Seconds between config change checks. `0` disables live reload. |
 | `INI_SECRETS_DIR`      | `/secrets/ini` | Directory of secret `.ini` values. |
+| `ZOMBIEBUDDY`          | `false`        | Install and load the [ZombieBuddy](https://github.com/zed-0xff/ZombieBuddy) Java agent (see below). |
+| `ZOMBIEBUDDY_POLICY`   | `allow-all`    | ZombieBuddy approval policy for Java mod JARs: `allow-all`, `deny-new` or `prompt`. |
+| `ZOMBIEBUDDY_ARGS`     | *(unset)*      | Extra ZombieBuddy agent parameters, comma-separated (e.g. `verbosity=1`). |
 
 Extra container arguments are passed to `start-server.sh`, for example `-debug`.
+
+### Java mods (ZombieBuddy)
+
+Some mods ship Java code and need the
+[ZombieBuddy](https://steamcommunity.com/sharedfiles/filedetails/?id=3619862853)
+Java agent. Mods whose JAR is client-only (`media/java/client/`) are skipped
+on a dedicated server, but others (e.g. RealLimbs) also run on the server, and
+the agent has to be on the JVM command line before the server starts.
+
+With `ZOMBIEBUDDY=true`, on every start the entrypoint:
+
+1. downloads the ZombieBuddy Workshop item with SteamCMD (anonymously), so the
+   agent always matches the mod version the server loads;
+2. copies `ZombieBuddy.jar` to the game directory;
+3. adds `-javaagent:…/ZombieBuddy.jar=frontend=console,policy=$ZOMBIEBUDDY_POLICY`
+   to the server's JVM options (`ProjectZomboid64.json`).
+
+Setting it back to `false` removes the agent again. You still list
+`ZombieBuddy` and its Workshop ID in `Mods=` / `WorkshopItems=` like any mod.
+
+Approval policy: ZombieBuddy normally asks before loading each new or changed
+Java mod JAR. A server can't show a dialog, so:
+
+- `allow-all` (default): every Java mod JAR loads, including after Workshop
+  updates. Java mods run unrestricted, so only use mods you trust.
+- `deny-new`: only JARs already approved in `$HOME/.zombie_buddy/mod_approvals.json`
+  load; anything new or updated is skipped silently.
+- `prompt`: asks on the server console; startup waits until you answer with
+  `pz-console`.
+
+Players need ZombieBuddy installed on their own game too (see the mod's
+installation guide).
 
 ### Volumes
 
@@ -119,8 +154,20 @@ once the player database exists.
 
 ## Server console
 
-The server reads commands from a FIFO. Use `pz-console` to send it a command;
-the output appears in the container logs:
+The container's stdin is forwarded to the server console, so you can attach
+to it like the server's own terminal: type commands, see the output live.
+
+```sh
+kubectl attach -i deploy/zomboid   # needs `stdin: true` in the pod spec
+docker attach --sig-proxy=false zomboid   # needs `docker run -i`
+```
+
+Keep `tty: false` (Kubernetes) and don't use `docker run -t`: with a TTY,
+Ctrl+C in the attached terminal sends SIGINT to the container and stops the
+server. Without one, Ctrl+C only ends the attach.
+
+For one-off commands, `pz-console` writes to the same console; the output
+appears in the container logs:
 
 ```sh
 kubectl exec deploy/zomboid -- pz-console players

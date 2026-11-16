@@ -18,6 +18,11 @@ SERVER_NAME="${SERVER_NAME:-servertest}"
 MAX_MEMORY="${MAX_MEMORY:-}"
 ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-}"
 CONFIG_POLL_INTERVAL="${CONFIG_POLL_INTERVAL:-10}"
+ZOMBIEBUDDY="${ZOMBIEBUDDY:-false}"
+ZOMBIEBUDDY_POLICY="${ZOMBIEBUDDY_POLICY:-allow-all}"
+ZOMBIEBUDDY_ARGS="${ZOMBIEBUDDY_ARGS:-}"
+ZOMBIEBUDDY_WORKSHOP_ID=3619862853
+GAME_APP_ID=108600 # Workshop items belong to the game, not the server app
 
 STEAMCMD_DIR="${STEAMCMD_DIR:-/data/steamcmd}"
 SERVER_DIR="${SERVER_DIR:-/data/server}"
@@ -80,6 +85,69 @@ set_max_memory() {
   [[ "$MAX_MEMORY" =~ ^[0-9]+[kKmMgG]$ ]] || die "MAX_MEMORY must look like 4096m or 6g, got '$MAX_MEMORY'"
   log "Setting JVM max heap to $MAX_MEMORY"
   sed -E -i "s/\"-Xmx[0-9]+[kKmMgG]\"/\"-Xmx${MAX_MEMORY}\"/" "$json"
+}
+
+# Rewrite the JVM's vmArgs in ProjectZomboid64.json: drop any ZombieBuddy
+# agent, then append $1 if given. Idempotent, safe to run on every start.
+set_zombiebuddy_agent() {
+  local json="$SERVER_DIR/ProjectZomboid64.json" tmp
+  [[ -f "$json" ]] || die "$json not found"
+  tmp="$(mktemp)"
+  jq --arg agent "${1:-}" '
+    .vmArgs = ([.vmArgs[] | select((startswith("-javaagent:") and contains("ZombieBuddy")) | not)]
+               + (if $agent == "" then [] else [$agent] end))
+  ' "$json" > "$tmp"
+  cat "$tmp" > "$json"
+  rm -f "$tmp"
+}
+
+# ZombieBuddy (https://github.com/zed-0xff/ZombieBuddy) is a Java agent that
+# Java mods (e.g. RealLimbs) need on the server too. The agent must be on the
+# JVM command line before the server starts, so it is downloaded here with
+# SteamCMD instead of waiting for the server's own Workshop download.
+setup_zombiebuddy() {
+  if [[ "$ZOMBIEBUDDY" != "true" ]]; then
+    set_zombiebuddy_agent ""
+    return 0
+  fi
+
+  case "$ZOMBIEBUDDY_POLICY" in
+    allow-all|deny-new) ;;
+    prompt) log "WARNING: ZOMBIEBUDDY_POLICY=prompt: startup blocks until each new Java mod is approved via pz-console" ;;
+    *) die "ZOMBIEBUDDY_POLICY must be allow-all, deny-new or prompt, got '$ZOMBIEBUDDY_POLICY'" ;;
+  esac
+
+  local src="$SERVER_DIR/steamapps/workshop/content/$GAME_APP_ID/$ZOMBIEBUDDY_WORKSHOP_ID/mods/ZombieBuddy/libs/ZombieBuddy.jar"
+  local jar="$SERVER_DIR/ZombieBuddy.jar"
+
+  if [[ "$UPDATE_ON_START" == "true" || ! -f "$src" ]]; then
+    local attempt output downloaded=false
+    for attempt in 1 2 3; do
+      log "Downloading ZombieBuddy (Workshop $ZOMBIEBUDDY_WORKSHOP_ID, attempt $attempt/3)"
+      output="$("$STEAMCMD_DIR/steamcmd.sh" +force_install_dir "$SERVER_DIR" +login anonymous \
+                  +workshop_download_item "$GAME_APP_ID" "$ZOMBIEBUDDY_WORKSHOP_ID" +quit 2>&1 || true)"
+      if [[ "$output" == *"Success. Downloaded item"* ]]; then
+        downloaded=true
+        break
+      fi
+      (( attempt < 3 )) && sleep 10
+    done
+    if [[ "$downloaded" != "true" ]]; then
+      printf '%s\n' "$output" | tail -n 5
+      [[ -f "$src" ]] || die "ZombieBuddy download failed"
+      log "WARNING: ZombieBuddy update failed, using the previous download"
+    fi
+  fi
+  [[ -f "$src" ]] || die "ZombieBuddy.jar not found at $src"
+
+  # Copied on every start so the agent always matches the mod's Lua side.
+  cp -f "$src" "$jar"
+
+  # frontend=console: no GUI on a server. With allow-all nothing is prompted;
+  # approvals for deny-new/prompt are kept in $HOME/.zombie_buddy.
+  local agent="-javaagent:$jar=frontend=console,policy=$ZOMBIEBUDDY_POLICY${ZOMBIEBUDDY_ARGS:+,$ZOMBIEBUDDY_ARGS}"
+  set_zombiebuddy_agent "$agent"
+  log "ZombieBuddy enabled (policy: $ZOMBIEBUDDY_POLICY)"
 }
 
 # Print the regular, non-hidden files of a directory. Kubernetes volume
@@ -211,6 +279,7 @@ watch_config() {
 }
 
 watcher_pid=""
+stdin_pid=""
 
 # shellcheck disable=SC2329 # invoked via trap
 shutdown() {
@@ -226,6 +295,7 @@ main() {
   fi
   link_steamclient
   set_max_memory
+  setup_zombiebuddy
 
   local fingerprint
   fingerprint="$(config_fingerprint)"
@@ -266,6 +336,12 @@ main() {
     watcher_pid=$!
   fi
 
+  # Forward the container's own stdin to the console, so `kubectl attach -i` /
+  # `docker attach` work like the server's terminal. Without an open stdin
+  # this reads /dev/null and exits immediately.
+  cat >&3 &
+  stdin_pid=$!
+
   # `wait` returns early when a trapped signal arrives; keep waiting until
   # the server process has actually exited.
   local status=0
@@ -274,6 +350,7 @@ main() {
     kill -0 "$server_pid" 2>/dev/null || break
   done
   [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
+  [[ -z "$stdin_pid" ]] || kill "$stdin_pid" 2>/dev/null || true
   log "Server exited with status $status"
   exit "$status"
 }
