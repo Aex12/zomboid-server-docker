@@ -3,7 +3,8 @@
 #
 # Game configuration is NOT templated from environment variables. Put the
 # server's own config files (<SERVER_NAME>.ini, <SERVER_NAME>_SandboxVars.lua,
-# ...) in $CONFIG_DIR and they are linked into the server's config directory.
+# ...) in $CONFIG_DIR. Secret .ini values (Password, DiscordToken, ...) go in
+# $INI_SECRETS_DIR as one file per key and are injected into the .ini.
 # Environment variables only control the container itself (install/update,
 # JVM heap, where things live).
 set -euo pipefail
@@ -14,14 +15,15 @@ STEAM_BRANCH="${STEAM_BRANCH:-public}"
 UPDATE_ON_START="${UPDATE_ON_START:-true}"
 VALIDATE="${VALIDATE:-false}"
 SERVER_NAME="${SERVER_NAME:-servertest}"
-CONFIG_MODE="${CONFIG_MODE:-link}"
 MAX_MEMORY="${MAX_MEMORY:-}"
 ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-}"
+CONFIG_POLL_INTERVAL="${CONFIG_POLL_INTERVAL:-10}"
 
 STEAMCMD_DIR="${STEAMCMD_DIR:-/data/steamcmd}"
 SERVER_DIR="${SERVER_DIR:-/data/server}"
 ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
 CONFIG_DIR="${CONFIG_DIR:-/config}"
+INI_SECRETS_DIR="${INI_SECRETS_DIR:-/secrets/ini}"
 CONSOLE_FIFO="${CONSOLE_FIFO:-/tmp/pz-console}"
 
 log() { printf '[entrypoint] %s\n' "$*"; }
@@ -80,46 +82,140 @@ set_max_memory() {
   sed -E -i "s/\"-Xmx[0-9]+[kKmMgG]\"/\"-Xmx${MAX_MEMORY}\"/" "$json"
 }
 
-# Link (or copy) every file in $CONFIG_DIR into <ZOMBOID_DIR>/Server/.
-#
-# link: symlinks. With a Kubernetes ConfigMap/Secret volume (no subPath) the
-#       files update in place; run `pz-console reloadoptions` to apply .ini
-#       changes without a restart.
-# copy: plain copies, refreshed on every start. Use this if the server
-#       refuses to start because it cannot write its config files.
+# Print the regular, non-hidden files of a directory. Kubernetes volume
+# internals (..data, ..<timestamp>) are dotfiles and never match the glob;
+# the visible entries are symlinks to files, which -f follows.
+list_files() {
+  local f
+  [[ -d "$1" ]] || return 0
+  for f in "$1"/*; do
+    [[ -f "$f" ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Read a secret file into the variable named $2: trailing newlines and a
+# trailing CR are stripped; embedded newlines are rejected.
+read_secret() {
+  # Underscored names so they don't shadow the caller's variable named in $2.
+  local _file="$1" _value
+  _value="$(<"$_file")"
+  _value="${_value%$'\r'}"
+  [[ "$_value" != *$'\n'* ]] || { log "ERROR: secret $(basename "$_file") contains a newline"; return 1; }
+  printf -v "$2" '%s' "$_value"
+}
+
+# Write <SERVER_NAME>.ini from $CONFIG_DIR, replacing the value of every key
+# that has a file in $INI_SECRETS_DIR. Done line by line in bash so values
+# containing ';', '#' or '=' (mod lists, passwords) are copied verbatim.
+render_ini() {
+  local name="$SERVER_NAME.ini"
+  local src="$CONFIG_DIR/$name"
+  local dest="$ZOMBOID_DIR/Server/$name"
+  local tmp="$dest.tmp"
+
+  declare -A secrets=()
+  local file key value
+  while IFS= read -r file; do
+    key="$(basename "$file")"
+    if [[ ! "$key" =~ ^[A-Za-z0-9_]+$ ]]; then
+      log "WARNING: ignoring $file: not a valid .ini key name"
+      continue
+    fi
+    read_secret "$file" value || return 1
+    secrets[$key]="$value"
+  done < <(list_files "$INI_SECRETS_DIR")
+
+  if [[ ! -f "$src" ]]; then
+    (( ${#secrets[@]} == 0 )) || log "WARNING: $src not found; secrets from $INI_SECRETS_DIR are not applied"
+    return 0
+  fi
+
+  declare -A injected=()
+  local line
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      key="${line%%=*}"
+      if [[ "$line" == *=* && "$key" =~ ^[A-Za-z0-9_]+$ && -v "secrets[$key]" ]]; then
+        printf '%s=%s\n' "$key" "${secrets[$key]}"
+        injected[$key]=1
+      else
+        printf '%s\n' "$line"
+      fi
+    done < "$src"
+    # Secrets for keys that are missing from the .ini are appended.
+    for key in "${!secrets[@]}"; do
+      [[ -v "injected[$key]" ]] || printf '%s=%s\n' "$key" "${secrets[$key]}"
+    done
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$dest"
+
+  if (( ${#secrets[@]} > 0 )); then
+    log "Config: $name (rendered, secrets: $(printf '%s\n' "${!secrets[@]}" | sort | paste -sd ' '))"
+  else
+    log "Config: $name (rendered)"
+  fi
+}
+
+# Install everything from $CONFIG_DIR into <ZOMBOID_DIR>/Server/:
+# the .ini is rendered (secrets injected), every other file is symlinked.
 install_config() {
   local dest_dir="$ZOMBOID_DIR/Server"
   mkdir -p "$dest_dir"
 
-  shopt -s nullglob
-  local files=("$CONFIG_DIR"/*)
-  shopt -u nullglob
-
+  local files=()
+  mapfile -t files < <(list_files "$CONFIG_DIR")
   if (( ${#files[@]} == 0 )); then
     log "WARNING: $CONFIG_DIR is empty; the server will generate default config files in $dest_dir"
-    return 0
   fi
 
-  local src name dest
+  local src name
   for src in "${files[@]}"; do
-    # Kubernetes volume internals (..data, ..<timestamp>) are dotfiles and
-    # never match the glob; the visible entries are symlinks to files.
-    [[ -f "$src" ]] || continue
     name="$(basename "$src")"
-    dest="$dest_dir/$name"
     [[ "$name" == "$SERVER_NAME"* ]] || log "WARNING: $name does not start with SERVER_NAME '$SERVER_NAME' and will be ignored by the server"
-    case "$CONFIG_MODE" in
-      link) ln -sfn "$src" "$dest" ;;
-      copy) rm -f "$dest"; cp -L "$src" "$dest" ;;
-      *) die "CONFIG_MODE must be 'link' or 'copy', got '$CONFIG_MODE'" ;;
-    esac
-    log "Config: $name ($CONFIG_MODE)"
+    [[ "$name" == "$SERVER_NAME.ini" ]] && continue
+    ln -sfn "$src" "$dest_dir/$name"
+    log "Config: $name (linked)"
+  done
+
+  render_ini
+}
+
+# Hash of the names and contents of all config and secret files.
+config_fingerprint() {
+  local f
+  { list_files "$CONFIG_DIR"; list_files "$INI_SECRETS_DIR"; } | while IFS= read -r f; do
+    printf '%s\n' "$f"
+    cat "$f" 2>/dev/null || true
+  done | md5sum
+}
+
+# Poll for config/secret changes; on change re-install the config and ask the
+# server to reload its .ini. Runs in the background next to the server.
+watch_config() {
+  local last="$1" current
+  while sleep "$CONFIG_POLL_INTERVAL"; do
+    current="$(config_fingerprint)"
+    [[ "$current" == "$last" ]] && continue
+    last="$current"
+    log "Config change detected"
+    # Subshell: a failing step must not kill the watcher.
+    if ( install_config ); then
+      log "Sending 'reloadoptions' (sandbox and mod changes need a restart)"
+      printf 'reloadoptions\n' >&3
+    else
+      log "WARNING: config not reloaded; fix the error above"
+    fi
   done
 }
+
+watcher_pid=""
 
 # shellcheck disable=SC2329 # invoked via trap
 shutdown() {
   log "Received stop signal, sending 'quit' to the server (it saves before exiting)"
+  [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
   printf 'quit\n' >&3 || true
 }
 
@@ -130,6 +226,9 @@ main() {
   fi
   link_steamclient
   set_max_memory
+
+  local fingerprint
+  fingerprint="$(config_fingerprint)"
   install_config
 
   local server_args=(-cachedir="$ZOMBOID_DIR" -servername "$SERVER_NAME")
@@ -140,15 +239,17 @@ main() {
   if [[ ! -f "$ZOMBOID_DIR/db/$SERVER_NAME.db" ]]; then
     if [[ -n "$ADMIN_PASSWORD_FILE" ]]; then
       [[ -r "$ADMIN_PASSWORD_FILE" ]] || die "ADMIN_PASSWORD_FILE '$ADMIN_PASSWORD_FILE' is not readable"
+      local admin_password
+      read_secret "$ADMIN_PASSWORD_FILE" admin_password || die "invalid ADMIN_PASSWORD_FILE"
       log "First start: creating admin account (the launcher prints the password to the log once)"
-      server_args+=(-adminpassword "$(<"$ADMIN_PASSWORD_FILE")")
+      server_args+=(-adminpassword "$admin_password")
     else
       log "WARNING: first start without ADMIN_PASSWORD_FILE; the server will wait for an admin password on its console (use pz-console)"
     fi
   fi
 
   # The server reads commands from stdin. Feed it from a FIFO so that the
-  # stop handler and `pz-console` can send commands to it.
+  # stop handler, the config watcher and `pz-console` can send commands.
   rm -f "$CONSOLE_FIFO"
   mkfifo "$CONSOLE_FIFO"
   exec 3<>"$CONSOLE_FIFO"
@@ -158,7 +259,12 @@ main() {
   log "Starting server '$SERVER_NAME'"
   cd "$SERVER_DIR"
   ./start-server.sh "${server_args[@]}" "$@" <&3 &
-  server_pid=$!
+  local server_pid=$!
+
+  if [[ "$CONFIG_POLL_INTERVAL" != "0" ]]; then
+    watch_config "$fingerprint" &
+    watcher_pid=$!
+  fi
 
   # `wait` returns early when a trapped signal arrives; keep waiting until
   # the server process has actually exited.
@@ -167,6 +273,7 @@ main() {
     if wait "$server_pid"; then status=0; else status=$?; fi
     kill -0 "$server_pid" 2>/dev/null || break
   done
+  [[ -z "$watcher_pid" ]] || kill "$watcher_pid" 2>/dev/null || true
   log "Server exited with status $status"
   exit "$status"
 }

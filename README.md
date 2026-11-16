@@ -9,8 +9,10 @@ configured with the server's **own config files**, not environment variables.
 - Uses the JRE bundled with the server, so the Java version always matches the
   game build.
 - Runs as UID 1000 and works with a read-only root filesystem.
-- Config files are mounted read-only and symlinked into place, so a Kubernetes
-  ConfigMap/Secret update reaches the server without a pod restart.
+- Config comes from read-only mounted files; secret values (join password,
+  Discord token, ...) are kept in separate files and injected into the `.ini`.
+- Config and secret changes are picked up while the server runs and applied
+  with `reloadoptions`, with no restart.
 - A clean shutdown on `SIGTERM` sends `quit` to the server console, so the
   world is saved.
 
@@ -22,8 +24,7 @@ ghcr.io/<owner>/zomboid-server:<version>
 
 ### Game settings: files in `/config`
 
-Every regular file in `/config` is linked into `<ZOMBOID_DIR>/Server/` under
-the same name. Use the file names the server expects for your `SERVER_NAME`:
+Put the server's config files in `/config`, named for your `SERVER_NAME`:
 
 | File                              | What                                   |
 | --------------------------------- | -------------------------------------- |
@@ -36,26 +37,54 @@ You don't need to write these by hand. Start the server once with an empty
 `/data/zomboid/Server/`. Copy them out, edit them, and from then on mount them
 in `/config`.
 
-`servertest.ini` contains `Password=` and `RCONPassword=`, so you may want to
-mount it from a Secret rather than a ConfigMap.
+`<SERVER_NAME>.ini` is rendered into `/data/zomboid/Server/` with secrets
+injected (see below). The other files are symlinked. The server tries to write
+those back on start and logs a `FileNotFoundException ... (Read-only file
+system)`. That is expected and harmless: the files in `/config` stay the single
+source of truth.
 
-On start (and on `reloadoptions`) the server tries to write its config files
-back and logs a `FileNotFoundException ... (Read-only file system)`. This is
-expected and harmless: the server keeps running with the mounted values, and
-the files in `/config` stay the single source of truth. In-game option changes
-made by admins are not persisted.
+### Secrets: files in `/secrets/ini`
+
+Keep secret `.ini` values out of `/config`: leave them empty there
+(`Password=`) and put each one in `/secrets/ini/<Key>`, with the value as the
+file's content:
+
+```
+/secrets/ini/Password        -> Password=<content>
+/secrets/ini/DiscordToken    -> DiscordToken=<content>
+```
+
+The value replaces that key's line in the rendered `.ini`; keys missing from
+the `.ini` are appended. Values are copied verbatim (`;`, `#`, `=` are fine);
+a trailing newline is stripped and multi-line values are rejected. Only key
+names are logged, never values. The rendered file is mode `0600`.
+
+Settings worth keeping secret: `Password` (join password), `DiscordToken`,
+`WebhookAddress` and `RCONPassword` if you enable those. You don't need RCON
+for administration: `pz-console` (below) sends commands to the same console.
+Leave `RCONPassword` empty to keep RCON disabled.
+
+The admin password is not an `.ini` setting; see `ADMIN_PASSWORD_FILE`.
+
+### Live reload
+
+Every `CONFIG_POLL_INTERVAL` seconds the entrypoint checks `/config` and
+`/secrets/ini` for changes. On a change it re-renders the config and sends
+`reloadoptions` to the server. Only `.ini` options are reloaded live; sandbox
+settings and mod lists are read at startup and need a restart.
 
 ### Container settings: environment variables
 
-| Variable              | Default       | Description |
-| --------------------- | ------------- | ----------- |
-| `SERVER_NAME`         | `servertest`  | Server name; selects which config files and world the server uses. |
-| `STEAM_BRANCH`        | `public`      | Steam branch to install (e.g. `public`, `unstable`). Clients must run the same build. |
-| `UPDATE_ON_START`     | `true`        | Run SteamCMD `app_update` on every start. The game is always installed if missing. |
-| `VALIDATE`            | `false`       | Add `validate` to the update (slow, re-hashes all files). |
-| `MAX_MEMORY`          | *(unset)*     | JVM max heap, e.g. `6g`. Patched into `ProjectZomboid64.json` on each start. |
-| `ADMIN_PASSWORD_FILE` | *(unset)*     | File containing the admin password, needed on the first start to create the admin account. |
-| `CONFIG_MODE`         | `link`        | `link` (symlink, live updates) or `copy` (copied on each start). |
+| Variable               | Default        | Description |
+| ---------------------- | -------------- | ----------- |
+| `SERVER_NAME`          | `servertest`   | Server name; selects which config files and world the server uses. |
+| `STEAM_BRANCH`         | `public`       | Steam branch to install (e.g. `public`, `unstable`). Clients must run the same build. |
+| `UPDATE_ON_START`      | `true`         | Run SteamCMD `app_update` on every start. The game is always installed if missing. |
+| `VALIDATE`             | `false`        | Add `validate` to the update (slow, re-hashes all files). |
+| `MAX_MEMORY`           | *(unset)*      | JVM max heap, e.g. `6g`. Patched into `ProjectZomboid64.json` on each start. |
+| `ADMIN_PASSWORD_FILE`  | *(unset)*      | File containing the admin password, used on the first start to create the admin account. |
+| `CONFIG_POLL_INTERVAL` | `10`           | Seconds between config change checks. `0` disables live reload. |
+| `INI_SECRETS_DIR`      | `/secrets/ini` | Directory of secret `.ini` values. |
 
 Extra container arguments are passed to `start-server.sh`, for example `-debug`.
 
@@ -64,14 +93,15 @@ Extra container arguments are passed to `start-server.sh`, for example `-debug`.
 | Path            | Content                                   | Persist?                            |
 | --------------- | ----------------------------------------- | ----------------------------------- |
 | `/data/server`  | Game install (several GB)                 | Recommended (avoids re-downloading) |
-| `/data/zomboid` | Saves, player DB, logs, generated config  | **Yes**                             |
+| `/data/zomboid` | Saves, player DB, logs, rendered config   | **Yes**                             |
 | `/data/steamcmd`, `/data/home` | SteamCMD and its state     | Optional                            |
 | `/config`       | Your config files, read-only              | -                                   |
+| `/secrets/ini`  | Secret `.ini` values, read-only           | -                                   |
 | `/tmp`          | Console FIFO, temp files                  | `tmpfs` / `emptyDir`, **must allow exec** |
 
-Mounting a single volume at `/data` covers all of them. With the game install
-persisted, `UPDATE_ON_START` only downloads what changed; a restart with no
-game update takes about 30 seconds.
+Mounting a single volume at `/data` covers all of the `/data` paths. With the
+game install persisted, `UPDATE_ON_START` only downloads what changed; a
+restart with no game update takes about 30 seconds.
 
 `/tmp` must not be `noexec`: the server's SQLite driver extracts and loads a
 native library from it. Without exec, the server fails with
@@ -94,43 +124,68 @@ the output appears in the container logs:
 
 ```sh
 kubectl exec deploy/zomboid -- pz-console players
-kubectl exec deploy/zomboid -- pz-console reloadoptions
+kubectl exec deploy/zomboid -- pz-console save
 kubectl exec deploy/zomboid -- pz-console 'servermsg "Restart in 5 minutes"'
 ```
 
-## Changing settings without a restart (Kubernetes)
+## Kubernetes
 
-1. Generate the ConfigMap **without** the hash suffix, so that a change edits
-   the existing ConfigMap instead of rolling the Deployment:
+Config in a ConfigMap, secrets in Secrets (for example SOPS-encrypted). Use
+`disableNameSuffixHash` so that an edit updates the existing ConfigMap in
+place (picked up by live reload) instead of rolling the Deployment:
 
-   ```yaml
-   # kustomization.yaml
-   configMapGenerator:
-     - name: zomboid-config
-       files:
-         - config/servertest.ini
-         - config/servertest_SandboxVars.lua
-       options:
-         disableNameSuffixHash: true
-   ```
+```yaml
+# kustomization.yaml
+configMapGenerator:
+  - name: zomboid-config
+    files:
+      - config/servertest.ini
+      - config/servertest_SandboxVars.lua
+    options:
+      disableNameSuffixHash: true
+```
 
-2. Mount it as a directory (**no `subPath`**, because `subPath` mounts never
-   update):
+```yaml
+# secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zomboid-ini-secrets
+stringData:
+  Password: friends-only
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zomboid-admin
+stringData:
+  admin-password: change-me
+```
 
-   ```yaml
-   volumeMounts:
-     - name: config
-       mountPath: /config
-       readOnly: true
-   ```
+```yaml
+# deployment.yaml (excerpt)
+env:
+  - name: ADMIN_PASSWORD_FILE
+    value: /secrets/admin/admin-password
+volumeMounts:
+  - { name: data, mountPath: /data }
+  - { name: tmp, mountPath: /tmp }
+  - { name: config, mountPath: /config, readOnly: true }
+  - { name: ini-secrets, mountPath: /secrets/ini, readOnly: true }
+  - { name: admin, mountPath: /secrets/admin, readOnly: true }
+volumes:
+  - { name: data, persistentVolumeClaim: { claimName: zomboid-data } }
+  - { name: tmp, emptyDir: {} }
+  - { name: config, configMap: { name: zomboid-config } }
+  - { name: ini-secrets, secret: { secretName: zomboid-ini-secrets } }
+  - { name: admin, secret: { secretName: zomboid-admin } }
+```
 
-3. After applying, wait for the kubelet to sync the volume (up to about a
-   minute), then run `pz-console reloadoptions`.
+Mount config and secrets as directories, **never with `subPath`**: `subPath`
+mounts are not updated when the ConfigMap or Secret changes. The kubelet syncs
+changes within about a minute, then live reload applies them.
 
-Only `.ini` options are reloaded live. Sandbox settings and mod lists are read
-at startup and need a restart.
-
-## Kubernetes notes
+Also:
 
 - Run a single replica with `strategy: Recreate`; the world can't be shared.
 - Set `terminationGracePeriodSeconds` to about 120, so the save on shutdown
@@ -138,8 +193,7 @@ at startup and need a restart.
 - Set the memory limit comfortably above `MAX_MEMORY` (the JVM uses memory
   beyond its heap).
 - Set `securityContext`: `runAsUser: 1000`, `runAsGroup: 1000`,
-  `fsGroup: 1000`, `readOnlyRootFilesystem: true`, and mount an `emptyDir` at
-  `/tmp`.
+  `fsGroup: 1000`, `readOnlyRootFilesystem: true`.
 
 ## Docker
 
@@ -148,7 +202,8 @@ docker run -d --name zomboid \
   -p 16261:16261/udp -p 16262:16262/udp \
   -v zomboid-data:/data \
   -v ./config:/config:ro \
-  -v ./admin-password:/secrets/admin-password:ro \
+  -v ./secrets/ini:/secrets/ini:ro \
+  -v ./secrets/admin-password:/secrets/admin-password:ro \
   -e ADMIN_PASSWORD_FILE=/secrets/admin-password \
   -e MAX_MEMORY=6g \
   --read-only --tmpfs /tmp:exec \
