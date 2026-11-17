@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Readiness check: succeeds while a socket is bound to the game port.
+# For a Kubernetes `readinessProbe` (exec).
+#
+# The server binds its game port (DefaultPort) as the last step of startup,
+# after installing Workshop items and loading the world, so a bound port
+# means players can join.
+#
+# /proc/net/udp{,6} list the sockets of the container's own network
+# namespace. With `hostNetwork: true` they list the host's, and any process
+# on the node using that port would count.
+set -euo pipefail
+
+SERVER_NAME="${SERVER_NAME:-servertest}"
+ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
+INI="$ZOMBOID_DIR/Server/$SERVER_NAME.ini"
+
+port=""
+if [[ -r "$INI" ]]; then
+  port="$(sed -n 's/^DefaultPort=//p' "$INI" | tail -n 1)"
+  port="${port%$'\r'}"
+fi
+[[ "$port" =~ ^[0-9]+$ ]] || port=16261
+
+# local_address is <hex address>:<hex port>, e.g. 00000000:3F85 for 16261.
+hex="$(printf '%04X' "$port")"
+tables=()
+for table in /proc/net/udp /proc/net/udp6; do # udp6 is missing without IPv6
+  [[ -r "$table" ]] && tables+=("$table")
+done
+if (( ${#tables[@]} > 0 )) &&
+   awk -v want=":$hex" 'FNR > 1 && substr($2, length($2) - 4) == want { found = 1; exit }
+                        END { exit !found }' "${tables[@]}"; then
+  exit 0
+fi
+echo "pz-ready: nothing bound to UDP port $port yet" >&2
+exit 1

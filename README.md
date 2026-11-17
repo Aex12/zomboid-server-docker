@@ -15,6 +15,8 @@ configured with the server's **own config files**, not environment variables.
   with `reloadoptions`, with no restart.
 - A clean shutdown on `SIGTERM` sends `quit` to the server console, so the
   world is saved.
+- A readiness check (`pz-ready`) that passes once players can join, for a
+  Kubernetes readiness probe (see [Readiness](#readiness)).
 - Optional automatic restarts, when a game or Workshop update is out and/or
   on a schedule, without kicking anyone (see [Automatic restarts](#automatic-restarts)).
 
@@ -324,6 +326,9 @@ volumeMounts:
   - { name: config, mountPath: /config, readOnly: true }
   - { name: ini-secrets, mountPath: /secrets/ini, readOnly: true }
   - { name: admin, mountPath: /secrets/admin, readOnly: true }
+readinessProbe:
+  exec: { command: ["pz-ready"] }
+  periodSeconds: 10
 volumes:
   - { name: data, persistentVolumeClaim: { claimName: zomboid-data } }
   - { name: tmp, emptyDir: {} }
@@ -345,6 +350,27 @@ Also:
   beyond its heap).
 - Set `securityContext`: `runAsUser: 1000`, `runAsGroup: 1000`,
   `fsGroup: 1000`, `readOnlyRootFilesystem: true`.
+
+### Readiness
+
+`pz-ready` passes once the server has bound its game port (`DefaultPort`
+from the `.ini`, default 16261). The server does that as the last step of
+startup, after the game update, Workshop downloads and loading the world, so
+**Ready means players can join**. Until then the pod shows `0/1`, and
+`kubectl wait --for=condition=Ready` and GitOps health checks (Argo CD, Flux)
+wait for a joinable server instead of a started container.
+
+It only checks that the server has started, not that it is responsive: a hung
+server stays Ready. There is deliberately no liveness probe (killing a game
+server on a false positive loses progress) and no startup probe (it would
+restart a server that is legitimately waiting on its console, e.g. on the
+first start without `ADMIN_PASSWORD_FILE`).
+
+Don't run the pod with `hostNetwork: true`. Besides exposing the host's
+network to the container, it breaks the check: `pz-ready` reads the
+container's socket table (`/proc/net/udp`), which with `hostNetwork` is the
+host's, so any other process on the node using the port would make the pod
+look Ready.
 
 ## Docker
 

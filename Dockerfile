@@ -57,7 +57,7 @@ RUN useradd --uid 1000 --user-group --no-create-home --home-dir /data/home steam
 COPY --from=downloads /opt/steamcmd /opt/steamcmd
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --from=downloads /usr/local/bin/rcon /usr/local/bin/supercronic /usr/local/bin/
-COPY --chmod=0755 pz-console pz-rcon pz-auto-restart /usr/local/bin/
+COPY --chmod=0755 pz-console pz-rcon pz-auto-restart pz-ready /usr/local/bin/
 
 ENV HOME=/data/home \
     STEAMCMD_DIR=/data/steamcmd \
