@@ -357,7 +357,11 @@ main() {
 
   log "Starting server '$SERVER_NAME'"
   cd "$SERVER_DIR"
-  ./start-server.sh "${server_args[@]}" "$@" <&3 &
+  # start-server.sh preloads libjsig.so but only searches jre64/lib/amd64 (the
+  # old Java 8 layout). Add jre64/lib for this process only; start-server.sh
+  # prepends its own paths, so linux64 still comes first.
+  LD_LIBRARY_PATH="$SERVER_DIR/jre64/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ./start-server.sh "${server_args[@]}" "$@" <&3 &
   local server_pid=$!
 
   if [[ "$CONFIG_POLL_INTERVAL" != "0" ]]; then
