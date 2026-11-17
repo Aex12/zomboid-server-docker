@@ -15,23 +15,36 @@ SERVER_NAME="${SERVER_NAME:-servertest}"
 ZOMBOID_DIR="${ZOMBOID_DIR:-/data/zomboid}"
 INI="$ZOMBOID_DIR/Server/$SERVER_NAME.ini"
 
+# This runs every few seconds next to the game server, so it uses only bash
+# builtins (no sed/awk/printf forks). The port is cached in /tmp and re-read
+# from the .ini only when the .ini is newer than the cache.
+CACHE="${TMPDIR:-/tmp}/pz-ready.port"
+
 port=""
-if [[ -r "$INI" ]]; then
-  port="$(sed -n 's/^DefaultPort=//p' "$INI" | tail -n 1)"
-  port="${port%$'\r'}"
+if [[ -r "$CACHE" && "$CACHE" -nt "$INI" ]]; then
+  read -r port < "$CACHE" || true
 fi
-[[ "$port" =~ ^[0-9]+$ ]] || port=16261
+
+if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+  port=""
+  if [[ -r "$INI" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == DefaultPort=* ]] && port="${line#DefaultPort=}" && port="${port%$'\r'}"
+    done < "$INI"
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] || port=16261 # unset/invalid: the game's default
+  # Cached too, defaults included. If the .ini is missing now, it will be newer
+  # than this cache once it appears, which triggers a re-read.
+  printf '%s\n' "$port" > "$CACHE" 2>/dev/null || true
+fi
 
 # local_address is <hex address>:<hex port>, e.g. 00000000:3F85 for 16261.
-hex="$(printf '%04X' "$port")"
-tables=()
+printf -v hex '%04X' "$port"
 for table in /proc/net/udp /proc/net/udp6; do # udp6 is missing without IPv6
-  [[ -r "$table" ]] && tables+=("$table")
+  [[ -r "$table" ]] || continue
+  while read -r _ local_address _; do
+    [[ "${local_address##*:}" == "$hex" ]] && exit 0
+  done < "$table"
 done
-if (( ${#tables[@]} > 0 )) &&
-   awk -v want=":$hex" 'FNR > 1 && substr($2, length($2) - 4) == want { found = 1; exit }
-                        END { exit !found }' "${tables[@]}"; then
-  exit 0
-fi
 echo "pz-ready: nothing bound to UDP port $port yet" >&2
 exit 1
